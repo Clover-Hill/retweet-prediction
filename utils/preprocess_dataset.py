@@ -36,11 +36,11 @@ def preprocess_split(dataset, split_name):
         processed = {
             # Direct copies
             'id': example['id'],
+            'retweet_count': example['retweet_count'],
             'text': example['text'],
-            'embedding': example['embeddings'],
+            # 'text_embedding': example['embeddings'],
             'user_verified': example['user_verified'],
             'user_followers_count': example['user_followers_count'],
-            'retweet_count': example['retweet_count'],
             
             # Boolean features
             'has_url': example.get('urls') is not None and len(example.get('urls', [])) > 0,
@@ -54,7 +54,7 @@ def preprocess_split(dataset, split_name):
         
         # Add viral flag for train/eval only
         if split_name in ['train', 'eval']:
-            processed['if_viral'] = example['retweet_count'] >= 100
+            processed['if_viral'] = example['retweet_count'] >= 10
         
         return processed
     
@@ -69,9 +69,9 @@ def preprocess_split(dataset, split_name):
     
     # Select columns
     columns = [
-        'text', 'embedding', 'has_url', 'has_hashtags', 
+        'text', 'retweet_count', 'has_url', 'has_hashtags', 
         'user_verified', 'text_length', 'user_followers_count',
-        'retweet_count', 'low_time_interval', 'high_hour_interval'
+        'low_time_interval', 'high_hour_interval'
     ]
     if split_name in ['train', 'eval']:
         columns.append('if_viral')
