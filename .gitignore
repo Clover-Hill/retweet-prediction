@@ -1,6 +1,8 @@
 data/
 knn/
 baseline/
+checkpoint/
+wandb/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
