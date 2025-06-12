@@ -23,6 +23,33 @@ def text_enrich(sample):
     
     return ret
 
+# Define feature categories based on the generated dataset
+DENSE_FEATURES = [
+    # Base metrics transformations
+    'user_followers_count_log', 'user_followers_count_z', 'user_followers_count_rank', 'user_followers_count_cdf',
+    'user_friends_count_log', 'user_friends_count_z', 'user_friends_count_rank', 'user_friends_count_cdf',
+    'user_statuses_count_log', 'user_statuses_count_z', 'user_statuses_count_rank', 'user_statuses_count_cdf',
+    'followers_friends_log', 'followers_friends_z', 'followers_friends_rank', 'followers_friends_cdf',
+    'followers_statuses_log', 'followers_statuses_z', 'followers_statuses_rank', 'followers_statuses_cdf',
+    'friends_statuses_log', 'friends_statuses_z', 'friends_statuses_rank', 'friends_statuses_cdf',
+    'followers_friends_statuses_log', 'followers_friends_statuses_z', 'followers_friends_statuses_rank', 'followers_friends_statuses_cdf',
+    # Count features
+    'mentions_count', 'hashtags_count', 'urls_count', 'n_unique_domains',
+    # Text features
+    'text_length', 'word_count', 'n_capital_letters', 'n_exclamation', 'n_question', 'n_punctuation',
+    'capital_ratio', 'exclamation_ratio', 'punctuation_ratio',
+    # Encoding features
+    'weekday_count_enc', 'hour_count_enc', 'day_count_enc', 'month_count_enc', 
+    'user_verified_count_enc', 'user_cluster_count_enc',
+    'weekday_target_enc', 'hour_target_enc', 'user_cluster_target_enc',
+    'user_followers_count_qbin_10_target_enc', 'user_friends_count_qbin_10_target_enc',
+    # Time features
+    'hours_from_latest',
+    # Original metrics (for compatibility)
+    'user_followers_count', 'user_friends_count', 'user_statuses_count',
+    'followers_friends', 'followers_statuses', 'friends_statuses', 'followers_friends_statuses'
+]
+
 # 1. Modified Feature Collator with Viral Class Support
 def feature_collator(batch, tokenizer, intervals=None, max_length=512, use_rich_text=False):
     """
@@ -56,31 +83,13 @@ def feature_collator(batch, tokenizer, intervals=None, max_length=512, use_rich_
     
     # Process scalar features
     batch_size = len(batch)
-    scalar_features = torch.zeros(batch_size, 7, dtype=torch.float32)
     
-    # Feature indices mapping
-    feature_mapping = {
-        'has_url': 0,
-        'has_hashtags': 1, 
-        'user_verified': 2,
-        'text_length': 3,
-        'user_followers_count': 4,
-        'low_time_interval': 5,
-        'high_hour_interval': 6
-    }
-    
-    # Fill scalar features
+    # Process dense features
+    scalar_features = torch.zeros(batch_size, len(DENSE_FEATURES), dtype=torch.float32)
     for i, item in enumerate(batch):
-        # Boolean features (keep as 0 or 1)
-        scalar_features[i, feature_mapping['has_url']] = float(item['has_url'])
-        scalar_features[i, feature_mapping['has_hashtags']] = float(item['has_hashtags'])
-        scalar_features[i, feature_mapping['user_verified']] = float(item['user_verified'])
-        scalar_features[i, feature_mapping['low_time_interval']] = float(item['low_time_interval'])
-        scalar_features[i, feature_mapping['high_hour_interval']] = float(item['high_hour_interval'])
-        
-        # Numerical features with log1p transformation for heavy-tailed distributions
-        scalar_features[i, feature_mapping['text_length']] = np.log1p(item['text_length'])
-        scalar_features[i, feature_mapping['user_followers_count']] = np.log1p(item['user_followers_count'])
+        for j, feat in enumerate(DENSE_FEATURES):
+            value = item.get(feat, 0)
+            scalar_features[i, j] = float(value)
     
     # Apply L2 normalization to scalar features
     scalar_features = F.normalize(scalar_features, p=2, dim=-1)
@@ -91,7 +100,7 @@ def feature_collator(batch, tokenizer, intervals=None, max_length=512, use_rich_
         if_viral = torch.tensor([-1] * batch_size, dtype=torch.float32)
     else:
         retweet_count = torch.tensor([item['retweet_count'] for item in batch], dtype=torch.float32)
-        if_viral = torch.tensor([item['if_viral'] for item in batch], dtype=torch.float32)
+        if_viral = torch.tensor([float(item['retweet_count']>=10) for item in batch], dtype=torch.float32)
     
     id = torch.tensor([item['id'] for item in batch], dtype=torch.long)
     
@@ -204,7 +213,7 @@ def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=
                 all_logits.extend(probabilities.cpu().numpy())
             else:
                 # For regression, predictions are the logits themselves
-                predictions = gathered_logits
+                predictions = torch.exp(gathered_logits)
             
             all_predictions.extend(predictions.cpu().numpy())
             all_labels.extend(gathered_labels.cpu().numpy())

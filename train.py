@@ -69,7 +69,7 @@ import torch.nn.functional as F
 from loguru import logger
 
 from model.RetweetModel import RetweetConfig, RetweetBaseModel, RetweetClassificationModel, RetweetRegressionModel, RetweetMultiRegressionModel
-from train_utils import feature_collator, evaluation_loop
+from train_utils import feature_collator, evaluation_loop, DENSE_FEATURES
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -350,7 +350,7 @@ def main():
     # Load config and model
     config = RetweetConfig.from_pretrained( args.model_name_or_path )
     config.mlp_num = args.mlp_num if args.mlp_num is not None else config.mlp_num
-    config.scalar_features_dim = args.scalar_features_dim if args.scalar_features_dim is not None else config.scalar_features_dim
+    config.scalar_features_dim = len(DENSE_FEATURES)
     config.dropout_rate = args.dropout_rate if args.dropout_rate is not None else config.dropout_rate
     # Classification Args
     config.neg_pos_ratio = args.neg_pos_ratio if args.neg_pos_ratio is not None else config.neg_pos_ratio
@@ -381,10 +381,10 @@ def main():
         
     retweet_datasets = load_from_disk(args.dataset_name)
     
-    if args.head_type == "regression" or args.head_type == "multi_regression":
+    if args.head_type == "multi_regression":
         # Only use viral tweets
-        retweet_datasets["train"] = retweet_datasets["train"].filter(lambda x: x['if_viral'] == 1)
-        retweet_datasets["eval"] = retweet_datasets["eval"].filter(lambda x: x['if_viral'] == 1)
+        retweet_datasets["train"] = retweet_datasets["train"].filter(lambda x: x['retweet_count'] >= 10)
+        retweet_datasets["eval"] = retweet_datasets["eval"].filter(lambda x: x['retweet_count'] >= 10)
     
     intervals = None
     if args.head_type == "multi_regression":
@@ -392,20 +392,12 @@ def main():
         with open("/fs-computility/plm/shared/jqcao/projects/retweet-prediction/feature_engineering/count_intervals.json", 'r') as f:
             intervals = json.load(f)
 
-    if args.use_rich_text:
-        feature_collate_fn = partial(
-            feature_collator,
-            tokenizer=tokenizer,
-            intervals=intervals,
-            use_rich_text=True
-        )
-    else:
-        feature_collate_fn = partial(
-            feature_collator,
-            tokenizer=tokenizer,
-            intervals=intervals,
-            use_rich_text=False
-        )
+    feature_collate_fn = partial(
+        feature_collator,
+        tokenizer=tokenizer,
+        intervals=intervals,
+        use_rich_text=False
+    )
         
     # --------------------------------------------------Start Training-----------------------------------------------------------
     train_dataset = retweet_datasets["train"]

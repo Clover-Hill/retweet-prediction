@@ -1,6 +1,6 @@
-DATASET=/fs-computility/plm/shared/jqcao/projects/retweet-prediction/data/preprocessed_dataset
+DATASET=/fs-computility/plm/shared/jqcao/projects/retweet-prediction/data/feature_dataset
 NUM_EPOCH=50
-LR="5e-4"
+LR="1e-4"
 
 # ACCELERATE_CONFIG=./accelerate_config/train-8-card.yaml
 ACCELERATE_CONFIG=./accelerate_config/eval.yaml
@@ -22,7 +22,6 @@ WANDB_PROJECT="retweet-prediction" accelerate launch \
     --num_train_epochs ${NUM_EPOCH} \
     --head_type "multi_regression" \
     --mlp_num 10 \
-    --scalar_features_dim 7 \
     --dropout_rate 0.1 \
     --neg_pos_ratio 5.67 \
     --num_class 16 \

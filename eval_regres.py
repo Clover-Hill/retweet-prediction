@@ -347,40 +347,21 @@ def main():
 
     # -------------------------------------------------Load Dataset and Model------------------------------------------------------------
     # Load config and model
-    classification_model = RetweetClassificationModel.from_pretrained( args.classification_model_path )
-    
-    regression_model = RetweetMultiRegressionModel.from_pretrained( args.regression_model_path )
+    regression_model = RetweetRegressionModel.from_pretrained( args.regression_model_path )
     
     # -------------------------------------------------Preprocess Dataset------------------------------------------------------------
     # Default to use gpt tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.classification_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.regression_model_path)
     retweet_datasets = load_from_disk(args.dataset_name)
     
     # --------------------------------------------------Evaluation-----------------------------------------------------------
-    classification_collate_fn = partial(
+    regression_collate_fn = partial(
         feature_collator,
         tokenizer=tokenizer,
         use_rich_text=False
     )
-    
-    regression_collate_fn = partial(
-        feature_collator,
-        tokenizer=tokenizer,
-        use_rich_text=True
-    )
 
-    with open("/fs-computility/plm/shared/jqcao/projects/retweet-prediction/feature_engineering/count_intervals.json", 'r') as f:
-        intervals = json.load(f)
-    weight = torch.tensor([interval['mean_val'] for interval in intervals], dtype=torch.float32)
-    
     if args.do_eval:
-        classification_dataloader = DataLoader(
-            retweet_datasets["eval"], collate_fn=classification_collate_fn, batch_size=args.per_device_eval_batch_size, 
-            shuffle=False,
-            num_workers=4,
-            prefetch_factor=4,
-            pin_memory=True
-        )
         regression_dataloader = DataLoader(
             retweet_datasets["eval"], collate_fn=regression_collate_fn, batch_size=args.per_device_eval_batch_size, 
             shuffle=False,
@@ -389,67 +370,38 @@ def main():
             pin_memory=True
         )
         # Create a partial function with your specific parameters
-        classification_model, regression_model, classification_dataloader, regression_dataloader = accelerator.prepare( classification_model, regression_model, classification_dataloader, regression_dataloader )
+        regression_model, regression_dataloader = accelerator.prepare( regression_model, regression_dataloader )
 
         all_regression_logits = []
-        all_classification_logits = []
         all_retweet_counts = []
 
-        classification_model.eval()
         regression_model.eval()
-        
-        for batch in tqdm(classification_dataloader, desc = "Evaluating Classification Model", disable=not accelerator.is_local_main_process):
-            with torch.no_grad():
-                classification_outputs = classification_model(
-                    input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask'],
-                    scalar_features=batch['scalar_features'],
-                )
-                classification_logits = classification_outputs.logits
-                classification_logits = torch.sigmoid(classification_logits)
-                
-                # Gather predictions and labels from all processes
-                gathered_logits = accelerator.gather_for_metrics(classification_logits)
-                gathered_retweet_counts = accelerator.gather_for_metrics(batch['retweet_count'])
-                
-                all_classification_logits.extend(gathered_logits.cpu().numpy().tolist())
-                all_retweet_counts.extend(gathered_retweet_counts.cpu().numpy().tolist())
         
         for batch in tqdm(regression_dataloader, desc = "Evaluating Regression Model", disable=not accelerator.is_local_main_process):
             with torch.no_grad():
                 regression_outputs = regression_model(
                     input_ids=batch['input_ids'],
                     attention_mask=batch['attention_mask'],
+                    scalar_features=batch['scalar_features'],
                 )
                 regression_logits = regression_outputs.logits
-                regression_logits = torch.softmax(regression_logits, dim=-1)
                 
                 # Gather predictions and labels from all processes
                 gathered_logits = accelerator.gather_for_metrics(regression_logits)
+                gathered_retweet_counts = accelerator.gather_for_metrics(batch['retweet_count'])
                 
                 all_regression_logits.extend(gathered_logits.cpu().numpy().tolist())
+                all_retweet_counts.extend(gathered_retweet_counts.cpu().numpy().tolist())
 
         # Only compute metrics on main process
         if accelerator.is_main_process:
-            all_classification_logits = torch.tensor(all_classification_logits)
             all_retweet_counts = torch.tensor(all_retweet_counts)
             
-            classification_predictions = (all_classification_logits > args.viral_threshold).float()
             mae_loss = 0
             
             for i in range(len(all_retweet_counts)):
-                if classification_predictions[i] == 1:
-                    prediction_class = torch.argmax(torch.tensor(all_regression_logits[i]), dim=-1)
-
-                    prediction = torch.sum(torch.tensor(all_regression_logits[i]) * weight, dim=-1)
-                    # prediction = intervals[prediction_class]["mean_val"]
-                    
-                    print(f"Probability: {all_regression_logits[i]}")
-                    print(f"Prediction: {prediction}, Actual: {all_retweet_counts[i]}")
-
-                    mae_loss += abs(all_retweet_counts[i] - prediction)
-                else:
-                    mae_loss += abs(all_retweet_counts[i] - 0)
+                logger.info(f"Retweet Count: {all_retweet_counts[i]}, Predicted: {all_regression_logits[i]}")
+                mae_loss += abs(all_retweet_counts[i] - all_regression_logits[i])
             
             logger.info(f"MAE Loss: {mae_loss / len(all_retweet_counts)}")
             
@@ -457,13 +409,6 @@ def main():
         return
 
     if args.do_test:
-        classification_dataloader = DataLoader(
-            retweet_datasets["test"], collate_fn=classification_collate_fn, batch_size=args.per_device_eval_batch_size, 
-            shuffle=False,
-            num_workers=4,
-            prefetch_factor=4,
-            pin_memory=True
-        )
         regression_dataloader = DataLoader(
             retweet_datasets["test"], collate_fn=regression_collate_fn, batch_size=args.per_device_eval_batch_size, 
             shuffle=False,
@@ -472,36 +417,19 @@ def main():
             pin_memory=True
         )
         # Create a partial function with your specific parameters
-        classification_model, regression_model, classification_dataloader, regression_dataloader = accelerator.prepare( classification_model, regression_model, classification_dataloader, regression_dataloader )
+        regression_model, regression_dataloader = accelerator.prepare( regression_model, regression_dataloader )
 
         all_regression_logits = []
-        all_classification_logits = []
-        classification_model.eval()
         regression_model.eval()
-        
-        for batch in tqdm(classification_dataloader, desc = "Evaluating Classification Model", disable=not accelerator.is_local_main_process):
-            with torch.no_grad():
-                classification_outputs = classification_model(
-                    input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask'],
-                    scalar_features=batch['scalar_features'],
-                )
-                classification_logits = classification_outputs.logits
-                classification_logits = torch.sigmoid(classification_logits)
-                
-                # Gather predictions and labels from all processes
-                gathered_logits = accelerator.gather_for_metrics(classification_logits)
-                
-                all_classification_logits.extend(gathered_logits.cpu().numpy().tolist())
         
         for batch in tqdm(regression_dataloader, desc = "Evaluating Regression Model", disable=not accelerator.is_local_main_process):
             with torch.no_grad():
                 regression_outputs = regression_model(
                     input_ids=batch['input_ids'],
                     attention_mask=batch['attention_mask'],
+                    scalar_features=batch['scalar_features'],
                 )
                 regression_logits = regression_outputs.logits
-                regression_logits = torch.softmax(regression_logits, dim=-1)
                 
                 # Gather predictions and labels from all processes
                 gathered_logits = accelerator.gather_for_metrics(regression_logits)
@@ -510,21 +438,14 @@ def main():
 
         # Only compute metrics on main process
         if accelerator.is_main_process:
-            all_classification_logits = torch.tensor(all_classification_logits)
-            
-            classification_predictions = (all_classification_logits > args.viral_threshold).float()
-            
             all_tweet_ids = []
             predicted_retweet_counts = []
 
             for i in range(len(retweet_datasets["test"])):
-                if classification_predictions[i] == 1:
-                    prediction_class = torch.argmax(torch.tensor(all_regression_logits[i]), dim=-1)
-                    prediction = torch.sum(torch.tensor(all_regression_logits[i]) * weight, dim=-1)
-                    
-                    predicted_retweet_counts.append(prediction.item())
-                else:
-                    predicted_retweet_counts.append(0)
+                if all_regression_logits[i] < 0:
+                    all_regression_logits[i] = 0
+                
+                predicted_retweet_counts.append(all_regression_logits[i])
                 
                 all_tweet_ids.append(retweet_datasets["test"][i]["id"])
             

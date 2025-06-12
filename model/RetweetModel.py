@@ -117,19 +117,28 @@ class RetweetRegressionModel(Qwen3PreTrainedModel):
         # Initialize Qwen3 model as the base
         self.qwen_model = Qwen3Model(config)
         
+        # Projection layers for fusion
+        self.text_projection = nn.Linear(config.hidden_size, config.hidden_size)
+        self.scalar_projection_1 = nn.Linear(config.scalar_features_dim, config.hidden_size//4)
+        self.scalar_projection_2 = nn.Linear(config.hidden_size//4, config.hidden_size)
+        self.out_projection = nn.Linear(config.hidden_size * 2, config.hidden_size)
+
+        self.text_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.scalar_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
         # MLP layers with layer norms (Pre-LN pattern)
         self.mlp_layers = nn.ModuleList()
         self.layer_norms = nn.ModuleList()
         
         mlp_config = type('MLPConfig', (), {
-            'hidden_size': config.hidden_size,
+            'hidden_size': config.hidden_size*2,
             'intermediate_size': config.hidden_size * 4,  # Standard MLP expansion ratio
             'hidden_act': config.hidden_act
         })()
         
         for _ in range(config.mlp_num):
             self.mlp_layers.append(Qwen3MLP(mlp_config))
-            self.layer_norms.append(Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
+            self.layer_norms.append(Qwen3RMSNorm(config.hidden_size * 2, eps=config.rms_norm_eps))
         
         # Final layer norm (optional but recommended)
         self.final_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -137,7 +146,6 @@ class RetweetRegressionModel(Qwen3PreTrainedModel):
         # Dropout for regularization
         self.dropout = nn.Dropout(config.dropout_rate)
 
-        # Output layer for regression
         self.regression_head = nn.Linear(config.hidden_size, 1)
         
         # Initialize weights
@@ -153,6 +161,7 @@ class RetweetRegressionModel(Qwen3PreTrainedModel):
         self,
         input_ids: torch.LongTensor,
         attention_mask: torch.Tensor,
+        scalar_features: torch.FloatTensor,
         labels: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
@@ -161,7 +170,6 @@ class RetweetRegressionModel(Qwen3PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        **kwargs
     ) -> torch.Tensor:
         """
         Forward pass for base model.
@@ -192,7 +200,19 @@ class RetweetRegressionModel(Qwen3PreTrainedModel):
         last_hidden_states = qwen_outputs.last_hidden_state
         text_embeddings = last_token_pool(last_hidden_states, attention_mask)
         
-        fusion_embeddings = text_embeddings
+        # Project text embeddings to hidden_size
+        text_projected = self.text_projection(text_embeddings)
+        text_projected = self.text_norm(text_projected)
+        text_projected = F.normalize(text_projected, p=2, dim=-1)
+        
+        # Project scalar features to hidden_size
+        scalar_projected = self.scalar_projection_1(scalar_features)
+        scalar_projected = self.scalar_projection_2(scalar_projected)
+        scalar_projected = self.scalar_norm(scalar_projected)
+        scalar_projected = F.normalize(scalar_projected, p=2, dim=-1)
+        
+        # Concatenate and normalize
+        fusion_embeddings = torch.cat([text_projected, scalar_projected], dim=-1)
         
         # Pass through MLP layers with Pre-LN pattern
         for layer_norm, mlp_layer in zip(self.layer_norms, self.mlp_layers):
@@ -204,8 +224,10 @@ class RetweetRegressionModel(Qwen3PreTrainedModel):
             fusion_embeddings = residual + fusion_embeddings
         
         # Final normalization
+        fusion_embeddings = self.out_projection(fusion_embeddings)
         fusion_embeddings = self.final_norm(fusion_embeddings)
-
+        fusion_embeddings = self.dropout(fusion_embeddings)
+        
         # Apply regression head
         logits = self.regression_head(fusion_embeddings).squeeze(-1)  # [batch_size]
         
@@ -213,13 +235,170 @@ class RetweetRegressionModel(Qwen3PreTrainedModel):
         if labels is not None:
             # L1 loss for regression
             loss_fct = nn.L1Loss()
-            loss = loss_fct(logits, labels.float())
+            loss = loss_fct(logits, torch.log(labels.float()+1e-6))
         
         return SequenceClassifierOutput(
             loss=loss,
             logits=logits,
             hidden_states=None,
             attentions=None,
+        )
+        
+class RetweetMultiRegressionModel(Qwen3PreTrainedModel):
+    """Base model for retweet prediction with Qwen3 backbone."""
+    
+    config_class = RetweetConfig
+    base_model_prefix = "qwen_model"
+    
+    def _init_weights(self, module):
+        std = self.config.initializer_range
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, Qwen3RMSNorm):
+            module.weight.data.fill_(1.0)
+
+    def __init__(self, config: RetweetConfig):
+        super().__init__(config)
+        self.config = config
+        
+        # Initialize Qwen3 model as the base
+        self.qwen_model = Qwen3Model(config)
+
+        # Number of classes for viral classification
+        self.num_class = getattr(config, 'num_class', 16)  # Default to 16 classes
+        
+        # Projection layers for fusion
+        self.text_projection = nn.Linear(config.hidden_size, config.hidden_size)
+        self.scalar_projection_1 = nn.Linear(config.scalar_features_dim, config.hidden_size//4)
+        self.scalar_projection_2 = nn.Linear(config.hidden_size//4, config.hidden_size)
+        self.out_projection = nn.Linear(config.hidden_size * 2, config.hidden_size)
+
+        self.text_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.scalar_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # MLP layers with layer norms (Pre-LN pattern)
+        self.mlp_layers = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
+        
+        mlp_config = type('MLPConfig', (), {
+            'hidden_size': config.hidden_size*2,
+            'intermediate_size': config.hidden_size * 4,  # Standard MLP expansion ratio
+            'hidden_act': config.hidden_act
+        })()
+        
+        for _ in range(config.mlp_num):
+            self.mlp_layers.append(Qwen3MLP(mlp_config))
+            self.layer_norms.append(Qwen3RMSNorm(config.hidden_size * 2, eps=config.rms_norm_eps))
+        
+        # Final layer norm (optional but recommended)
+        self.final_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(config.dropout_rate)
+
+        # Classification head for multi-class prediction
+        self.classification_head = nn.Linear(config.hidden_size, self.num_class)
+        
+        # Initialize weights
+        self.post_init()
+    
+    def get_input_embeddings(self):
+        return self.qwen_model.embed_tokens
+    
+    def set_input_embeddings(self, value):
+        self.qwen_model.embed_tokens = value
+    
+    def forward(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        scalar_features: torch.FloatTensor,
+        labels: Optional[torch.FloatTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass for base model.
+        
+        Args:
+            input_ids: Input token IDs [batch_size, seq_len]
+            attention_mask: Attention mask [batch_size, seq_len]
+            scalar_features: Scalar features [batch_size, 7]
+            Other args are passed to Qwen3Model
+        
+        Returns:
+            Fusion embeddings after MLP layers [batch_size, hidden_size]
+        """
+        # Get Qwen3 outputs
+        qwen_outputs = self.qwen_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True
+        )
+        
+        # Get last hidden states and apply last token pooling
+        last_hidden_states = qwen_outputs.last_hidden_state
+        text_embeddings = last_token_pool(last_hidden_states, attention_mask)
+        
+        # Project text embeddings to hidden_size
+        text_projected = self.text_projection(text_embeddings)
+        text_projected = self.text_norm(text_projected)
+        text_projected = F.normalize(text_projected, p=2, dim=-1)
+        
+        # Project scalar features to hidden_size
+        scalar_projected = self.scalar_projection_1(scalar_features)
+        scalar_projected = self.scalar_projection_2(scalar_projected)
+        scalar_projected = self.scalar_norm(scalar_projected)
+        scalar_projected = F.normalize(scalar_projected, p=2, dim=-1)
+        
+        # Concatenate and normalize
+        fusion_embeddings = torch.cat([text_projected, scalar_projected], dim=-1)
+        
+        # Pass through MLP layers with Pre-LN pattern
+        for layer_norm, mlp_layer in zip(self.layer_norms, self.mlp_layers):
+            # Pre-LN: Normalize -> MLP -> Residual
+            residual = fusion_embeddings
+            fusion_embeddings = layer_norm(fusion_embeddings)
+            fusion_embeddings = mlp_layer(fusion_embeddings)
+            fusion_embeddings = self.dropout(fusion_embeddings)  # Apply dropout
+            fusion_embeddings = residual + fusion_embeddings
+        
+        # Final normalization
+        fusion_embeddings = self.out_projection(fusion_embeddings)
+        fusion_embeddings = self.final_norm(fusion_embeddings)
+        fusion_embeddings = self.dropout(fusion_embeddings)
+        
+        # Apply classification head
+        logits = self.classification_head(fusion_embeddings)  # [batch_size, num_class]
+        
+        loss = None
+        if labels is not None:
+            # Cross-entropy loss with optional class weights
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits, labels)
+        
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=qwen_outputs.hidden_states if output_hidden_states else None,
+            attentions=qwen_outputs.attentions if output_attentions else None,
         )
 
 class RetweetBaseModel(Qwen3PreTrainedModel):
@@ -378,143 +557,6 @@ class RetweetBaseModel(Qwen3PreTrainedModel):
         fusion_embeddings = self.final_norm(fusion_embeddings)
         
         return fusion_embeddings
-
-class RetweetMultiRegressionModel(Qwen3PreTrainedModel):
-    """
-    Retweet viral class prediction model using Cross-Entropy loss.
-    Based on RetweetRegressionModel but adapted for multi-class classification.
-    """
-    
-    config_class = RetweetConfig
-    base_model_prefix = "qwen_model"
-    
-    def _init_weights(self, module):
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, Qwen3RMSNorm):
-            module.weight.data.fill_(1.0)
-
-    def __init__(self, config: RetweetConfig):
-        super().__init__(config)
-        self.config = config
-        
-        # Number of classes for viral classification
-        self.num_class = getattr(config, 'num_class', 16)  # Default to 16 classes
-        
-        # Initialize Qwen3 model as the base
-        self.qwen_model = Qwen3Model(config)
-        
-        # MLP layers with layer norms (Pre-LN pattern)
-        self.mlp_layers = nn.ModuleList()
-        self.layer_norms = nn.ModuleList()
-        
-        mlp_config = type('MLPConfig', (), {
-            'hidden_size': config.hidden_size,
-            'intermediate_size': config.hidden_size * 4,  # Standard MLP expansion ratio
-            'hidden_act': config.hidden_act
-        })()
-        
-        for _ in range(config.mlp_num):
-            self.mlp_layers.append(Qwen3MLP(mlp_config))
-            self.layer_norms.append(Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
-        
-        # Final layer norm
-        self.final_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        
-        # Classification head for multi-class prediction
-        self.classification_head = nn.Linear(config.hidden_size, self.num_class)
-        
-        # Initialize weights
-        self.post_init()
-    
-    def get_input_embeddings(self):
-        return self.qwen_model.embed_tokens
-    
-    def set_input_embeddings(self, value):
-        self.qwen_model.embed_tokens = value
-    
-    def set_class_weights(self, weights):
-        """Set class weights for handling imbalanced classes"""
-        self.class_weights = torch.tensor(weights, dtype=torch.float32)
-    
-    def forward(
-        self,
-        input_ids: torch.LongTensor,
-        attention_mask: torch.Tensor,
-        labels: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **kwargs
-    ) -> SequenceClassifierOutput:
-        """
-        Forward pass for multi-class classification model.
-        
-        Args:
-            input_ids: Input token IDs [batch_size, seq_len]
-            attention_mask: Attention mask [batch_size, seq_len]
-            labels: Class labels [batch_size] with values in [0, num_class)
-            Other args are passed to Qwen3Model
-        
-        Returns:
-            SequenceClassifierOutput with loss and logits
-        """
-        # Get Qwen3 outputs
-        qwen_outputs = self.qwen_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=True
-        )
-        
-        # Get last hidden states and apply last token pooling
-        last_hidden_states = qwen_outputs.last_hidden_state
-        text_embeddings = last_token_pool(last_hidden_states, attention_mask)
-        
-        fusion_embeddings = text_embeddings
-        
-        # Pass through MLP layers with Pre-LN pattern
-        for layer_norm, mlp_layer in zip(self.layer_norms, self.mlp_layers):
-            # Pre-LN: Normalize -> MLP -> Residual
-            residual = fusion_embeddings
-            fusion_embeddings = layer_norm(fusion_embeddings)
-            fusion_embeddings = mlp_layer(fusion_embeddings)
-            fusion_embeddings = residual + fusion_embeddings
-        
-        # Final normalization
-        fusion_embeddings = self.final_norm(fusion_embeddings)
-
-        # Apply classification head
-        logits = self.classification_head(fusion_embeddings)  # [batch_size, num_class]
-        
-        loss = None
-        if labels is not None:
-            # Cross-entropy loss with optional class weights
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits, labels)
-        
-        return SequenceClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=qwen_outputs.hidden_states if output_hidden_states else None,
-            attentions=qwen_outputs.attentions if output_attentions else None,
-        )
 
 # class RetweetRegressionModelLegacy(RetweetBaseModel):
 #     """Model for retweet count regression."""
