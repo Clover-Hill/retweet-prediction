@@ -12,6 +12,17 @@ from tqdm import tqdm
 from typing import Optional, Tuple
 from transformers.modeling_outputs import SequenceClassifierOutput
 
+def text_enrich(sample):
+    ret = ""
+    ret += "Text Length: {} | ".format(sample['text_length'])
+    ret += "Low Time Interval: {} | ".format(sample['low_time_interval'])
+    ret += "Followers: {} | ".format(sample['user_followers_count'])
+    ret += "URLs: {} | ".format(sample['urls'] if sample.get('urls') else 0)
+    ret += "Hashtags: {} | ".format(sample['hashtags'] if sample.get('hashtags') else 0)
+    ret += "Tweet: {}".format(sample['text'])
+    
+    return ret
+
 # 1. Modified Feature Collator with Viral Class Support
 def feature_collator(batch, tokenizer, intervals=None, max_length=512):
     """
@@ -29,7 +40,7 @@ def feature_collator(batch, tokenizer, intervals=None, max_length=512):
     """
     
     # Extract texts and tokenize
-    texts = [item['text'] for item in batch]
+    texts = [text_enrich(item) for item in batch]
     
     # Tokenize texts
     encoded = tokenizer(
@@ -112,7 +123,7 @@ def get_class_for_retweet_count(retweet_count, intervals):
     return None
 
 # 2. Modified Evaluation Loop with Multi-class Support
-def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=16):
+def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=16, intervals=None):
     """
     Evaluate the model on the evaluation dataset.
     
@@ -129,10 +140,15 @@ def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=
     model.eval()
     
     all_predictions = []
+    all_retweet_count = []
     all_labels = []
     all_logits = []  # For multi-class, we might want probabilities
+    all_weighted_predictions = []
     total_loss = 0
     num_batches = 0
+    
+    if intervals is not None:
+        weight = torch.tensor([interval['mean_val'] for interval in intervals], dtype=torch.float32)
     
     with torch.no_grad():
         for batch in tqdm(eval_dataloader, desc="Evaluating", disable=not accelerator.is_local_main_process):
@@ -159,6 +175,7 @@ def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=
             gathered_loss = accelerator.gather(loss)
             gathered_logits = accelerator.gather(logits)
             gathered_labels = accelerator.gather(labels)
+            gathered_retweet_count = accelerator.gather(batch['retweet_counts'])
             
             total_loss += gathered_loss.mean().item()
             num_batches += 1
@@ -171,6 +188,9 @@ def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=
                 predictions = torch.argmax(gathered_logits, dim=-1)
                 # Store probabilities instead of raw logits
                 probabilities = torch.softmax(gathered_logits, dim=-1)
+
+                weighted_predictions = torch.sum(probabilities * weight.to(probabilities.device), dim=-1)
+                all_weighted_predictions.extend(weighted_predictions.cpu().numpy())
                 all_logits.extend(probabilities.cpu().numpy())
             else:
                 # For regression, predictions are the logits themselves
@@ -178,6 +198,7 @@ def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=
             
             all_predictions.extend(predictions.cpu().numpy())
             all_labels.extend(gathered_labels.cpu().numpy())
+            all_retweet_count.extend(gathered_retweet_count.cpu().numpy())
     
     # Calculate metrics based on head type
     metrics = {}
@@ -216,6 +237,12 @@ def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=
         metrics['f1'] = f1
         
     elif head_type == "multi_regression":  # multi_class
+        mae = mean_absolute_error(all_retweet_count, all_weighted_predictions)
+        mse = mean_squared_error(all_retweet_count, all_weighted_predictions)
+        
+        metrics['mae'] = mae
+        metrics['mse'] = mse
+
         # Multi-class classification metrics
         all_predictions = np.array(all_predictions)
         all_labels = np.array(all_labels)
@@ -223,29 +250,6 @@ def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=
         # Overall accuracy
         accuracy = accuracy_score(all_labels, all_predictions)
         metrics['accuracy'] = accuracy
-        
-        # If we have probabilities, calculate additional metrics
-        if all_logits:
-            all_probs = np.array(all_logits)
-            
-            # Top-k accuracy
-            for k in [3, 5]:
-                if k < num_classes:
-                    top_k_preds = np.argsort(all_probs, axis=1)[:, -k:]
-                    top_k_correct = np.any(top_k_preds == all_labels[:, np.newaxis], axis=1)
-                    top_k_accuracy = np.mean(top_k_correct)
-                    metrics[f'top_{k}_accuracy'] = top_k_accuracy
-            
-            # Average confidence in predictions
-            max_probs = np.max(all_probs, axis=1)
-            metrics['mean_confidence'] = np.mean(max_probs)
-            metrics['std_confidence'] = np.std(max_probs)
-            
-            # Log loss (cross-entropy)
-            epsilon = 1e-15  # For numerical stability
-            all_probs = np.clip(all_probs, epsilon, 1 - epsilon)
-            log_loss_value = -np.mean(np.log(all_probs[np.arange(len(all_labels)), all_labels]))
-            metrics['log_loss'] = log_loss_value
         
         # Per-class and averaged metrics
         precision_macro = precision_score(all_labels, all_predictions, average='macro', zero_division=0)
@@ -263,19 +267,5 @@ def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=
         metrics['recall_micro'] = recall_micro
         metrics['f1_micro'] = f1_micro
         
-        # Confusion matrix
-        cm = confusion_matrix(all_labels, all_predictions)
-        metrics['confusion_matrix'] = cm.tolist()  # Convert to list for JSON serialization
-        
-        # Per-class metrics
-        per_class_precision = precision_score(all_labels, all_predictions, average=None, zero_division=0)
-        per_class_recall = recall_score(all_labels, all_predictions, average=None, zero_division=0)
-        per_class_f1 = f1_score(all_labels, all_predictions, average=None, zero_division=0)
-        
-        # Store per-class metrics
-        for i in range(num_classes):
-            metrics[f'class_{i}_precision'] = per_class_precision[i] if i < len(per_class_precision) else 0.0
-            metrics[f'class_{i}_recall'] = per_class_recall[i] if i < len(per_class_recall) else 0.0
-            metrics[f'class_{i}_f1'] = per_class_f1[i] if i < len(per_class_f1) else 0.0
         
     return metrics

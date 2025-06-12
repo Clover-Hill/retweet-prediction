@@ -3,13 +3,9 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
-# Configuration
-embedding_path = "/home/jqcao/projects/retweet-prediction/data/embedding_dataset"
-output_path = "/home/jqcao/projects/retweet-prediction/data/preprocessed_dataset"
-
 # Load dataset
-print(f"Loading dataset from: {embedding_path}")
-embedding_dataset = datasets.load_from_disk(embedding_path)
+raw_dataset = datasets.load_from_disk("./data/raw_dataset")
+output_path = "./data/preprocessed_dataset"
 
 def preprocess_split(dataset, split_name):
     """Preprocess a single dataset split"""
@@ -33,12 +29,12 @@ def preprocess_split(dataset, split_name):
         hour = dt.hour
         
         # Create processed example
-        processed = {
+        processed = example
+        processed.update({
             # Direct copies
             'id': example['id'],
             'retweet_count': example['retweet_count'],
             'text': example['text'],
-            # 'text_embedding': example['embeddings'],
             'user_verified': example['user_verified'],
             'user_followers_count': example['user_followers_count'],
             
@@ -50,7 +46,7 @@ def preprocess_split(dataset, split_name):
             'text_length': len(example['text']) if example['text'] else 0,
             'low_time_interval': interval in [5, 6, 7, 8],  # Low viral intervals
             'high_hour_interval': 6 <= hour < 12,  # Morning hours (high viral)
-        }
+        })
         
         # Add viral flag for train/eval only
         if split_name in ['train', 'eval']:
@@ -68,23 +64,25 @@ def preprocess_split(dataset, split_name):
     )
     
     # Select columns
-    columns = [
-        'text', 'retweet_count', 'has_url', 'has_hashtags', 
-        'user_verified', 'text_length', 'user_followers_count',
-        'low_time_interval', 'high_hour_interval'
-    ]
-    if split_name in ['train', 'eval']:
-        columns.append('if_viral')
+    # columns = [
+    #     'text', 'retweet_count', 'has_url', 'has_hashtags', 
+    #     'user_verified', 'text_length', 'user_followers_count',
+    #     'low_time_interval', 'high_hour_interval'
+    # ]
+    # if split_name in ['train', 'eval']:
+    #     columns.append('if_viral')
     
-    return processed.select_columns(columns)
+    # return processed.select_columns(columns)
+    return processed
 
 # Process all splits
 processed_splits = {}
-for split_name in embedding_dataset.keys():
-    processed_splits[split_name] = preprocess_split(embedding_dataset[split_name], split_name)
+for split_name in raw_dataset.keys():
+    processed_splits[split_name] = preprocess_split(raw_dataset[split_name], split_name)
 
 # Create and save new dataset
 preprocessed_dataset = datasets.DatasetDict(processed_splits)
+print(f"Preprocessed dataset: {preprocessed_dataset}")
 print(f"\nSaving to: {output_path}")
 preprocessed_dataset.save_to_disk(output_path)
 

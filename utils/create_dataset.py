@@ -1,8 +1,8 @@
 import numpy as np
 import datasets 
 
-train_path = "/home/jqcao/projects/retweet-prediction/data/train.csv"
-test_path = "/home/jqcao/projects/retweet-prediction/data/evaluation.csv"
+train_path = "./data/train.csv"
+test_path = "./data/evaluation.csv"
 
 raw_dataset = datasets.load_dataset("csv", data_files={"train": train_path, "test": test_path})
 
@@ -21,4 +21,4 @@ raw_dataset["train"] = raw_dataset["train"].select(train_indices)
 print(raw_dataset)
 print(f"Train set size: {len(raw_dataset['train'])}, Eval set size: {len(raw_dataset['eval'])}, Test set size: {len(raw_dataset['test'])}")
 
-raw_dataset.save_to_disk("data/retweet_dataset")
+raw_dataset.save_to_disk("./data/raw_dataset")

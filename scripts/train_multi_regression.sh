@@ -2,7 +2,8 @@ DATASET=/fs-computility/plm/shared/jqcao/projects/retweet-prediction/data/prepro
 NUM_EPOCH=50
 LR="5e-4"
 
-ACCELERATE_CONFIG=./accelerate_config/train-8-card.yaml
+# ACCELERATE_CONFIG=./accelerate_config/train-8-card.yaml
+ACCELERATE_CONFIG=./accelerate_config/eval.yaml
 MODEL=/fs-computility/plm/shared/jqcao/models/Qwen3/Qwen3-Embedding-0.6B
 OUTPUT_DIR=/fs-computility/plm/shared/jqcao/projects/retweet-prediction/checkpoint/viral-multi_regression-epoch-${NUM_EPOCH}
 

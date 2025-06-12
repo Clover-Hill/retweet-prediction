@@ -298,9 +298,6 @@ class RetweetMultiRegressionModel(Qwen3PreTrainedModel):
         # Final layer norm
         self.final_norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
-        # Dropout for regularization
-        self.dropout = nn.Dropout(config.dropout_rate)
-
         # Classification head for multi-class prediction
         self.classification_head = nn.Linear(config.hidden_size, self.num_class)
         
@@ -368,7 +365,6 @@ class RetweetMultiRegressionModel(Qwen3PreTrainedModel):
             residual = fusion_embeddings
             fusion_embeddings = layer_norm(fusion_embeddings)
             fusion_embeddings = mlp_layer(fusion_embeddings)
-            fusion_embeddings = self.dropout(fusion_embeddings)
             fusion_embeddings = residual + fusion_embeddings
         
         # Final normalization

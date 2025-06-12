@@ -69,7 +69,7 @@ import torch.nn.functional as F
 from loguru import logger
 
 from model.RetweetModel import RetweetConfig, RetweetBaseModel, RetweetClassificationModel, RetweetRegressionModel, RetweetMultiRegressionModel
-from utils import feature_collator, evaluation_loop
+from train_utils import feature_collator, evaluation_loop
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
@@ -377,7 +377,7 @@ def main():
         
     retweet_datasets = load_from_disk(args.dataset_name)
     
-    if args.head_type == "regression":
+    if args.head_type == "regression" or args.head_type == "multi_regression":
         # Only use viral tweets
         retweet_datasets["train"] = retweet_datasets["train"].filter(lambda x: x['if_viral'] == 1)
         retweet_datasets["eval"] = retweet_datasets["eval"].filter(lambda x: x['if_viral'] == 1)
@@ -619,9 +619,9 @@ def main():
         
         if eval_dataloader is not None:
             logger.info(f"Evaluation for epoch {epoch + 1}")
-            evaluation_metric = evaluation_loop(model, eval_dataloader, args.head_type, accelerator)
             
             if args.head_type == "classification":
+                evaluation_metric = evaluation_loop(model, eval_dataloader, args.head_type, accelerator)
                 to_be_logged = {
                     "eval/eval_loss": evaluation_metric['eval_loss'],
                     "eval/eval_accuracy": evaluation_metric['accuracy'],
@@ -631,6 +631,7 @@ def main():
                 }
                 accelerator.log(to_be_logged,step=completed_steps)
             elif args.head_type == "regression":
+                evaluation_metric = evaluation_loop(model, eval_dataloader, args.head_type, accelerator)
                 to_be_logged = {
                     "eval/eval_loss": evaluation_metric['eval_loss'],
                     "eval/eval_mae": evaluation_metric['mae'],
@@ -638,16 +639,19 @@ def main():
                 }
                 accelerator.log(to_be_logged,step=completed_steps)
             elif args.head_type == "multi_regression":
+                evaluation_metric = evaluation_loop(model, eval_dataloader, args.head_type, accelerator, intervals = intervals)
                 to_be_logged = {
                     "eval/eval_loss": evaluation_metric['eval_loss'],
                     "eval/eval_accuracy": evaluation_metric['accuracy'],
                     "eval/eval_precision": evaluation_metric['precision_macro'],
                     "eval/eval_f1": evaluation_metric['f1_macro'],
                     "eval/eval_recall": evaluation_metric['recall_macro'],
+                    "eval/eval_mae": evaluation_metric['mae'],
+                    "eval/eval_mse": evaluation_metric['mse'],
                 }
                 accelerator.log(to_be_logged,step=completed_steps)
 
-            logger.info(f"Evaluation metrics: {evaluation_metric}")
+            logger.info(f"Evaluation metrics: {to_be_logged}")
             
         if args.checkpointing_steps == "epoch":
             output_dir = f"epoch_{epoch}"
