@@ -1,0 +1,178 @@
+[
+  {
+    "class_index": 0,
+    "interval_start": 10.0,
+    "interval_end": 11.0,
+    "mean_val": 10.41277208706786,
+    "num_samples": 6248,
+    "sample_indices": [
+      0,
+      6248
+    ]
+  },
+  {
+    "class_index": 1,
+    "interval_start": 11.0,
+    "interval_end": 14.0,
+    "mean_val": 12.30297695262484,
+    "num_samples": 6248,
+    "sample_indices": [
+      6248,
+      12496
+    ]
+  },
+  {
+    "class_index": 2,
+    "interval_start": 14.0,
+    "interval_end": 16.0,
+    "mean_val": 14.871638924455826,
+    "num_samples": 6248,
+    "sample_indices": [
+      12496,
+      18744
+    ]
+  },
+  {
+    "class_index": 3,
+    "interval_start": 16.0,
+    "interval_end": 20.0,
+    "mean_val": 18.034250960307297,
+    "num_samples": 6248,
+    "sample_indices": [
+      18744,
+      24992
+    ]
+  },
+  {
+    "class_index": 4,
+    "interval_start": 20.0,
+    "interval_end": 25.0,
+    "mean_val": 22.084026888604352,
+    "num_samples": 6248,
+    "sample_indices": [
+      24992,
+      31240
+    ]
+  },
+  {
+    "class_index": 5,
+    "interval_start": 25.0,
+    "interval_end": 31.0,
+    "mean_val": 27.61683738796415,
+    "num_samples": 6248,
+    "sample_indices": [
+      31240,
+      37488
+    ]
+  },
+  {
+    "class_index": 6,
+    "interval_start": 31.0,
+    "interval_end": 40.0,
+    "mean_val": 35.00512163892446,
+    "num_samples": 6248,
+    "sample_indices": [
+      37488,
+      43736
+    ]
+  },
+  {
+    "class_index": 7,
+    "interval_start": 40.0,
+    "interval_end": 52.0,
+    "mean_val": 45.554417413572345,
+    "num_samples": 6248,
+    "sample_indices": [
+      43736,
+      49984
+    ]
+  },
+  {
+    "class_index": 8,
+    "interval_start": 52.0,
+    "interval_end": 70.0,
+    "mean_val": 60.71446862996159,
+    "num_samples": 6248,
+    "sample_indices": [
+      49984,
+      56232
+    ]
+  },
+  {
+    "class_index": 9,
+    "interval_start": 70.0,
+    "interval_end": 98.0,
+    "mean_val": 83.13604353393086,
+    "num_samples": 6248,
+    "sample_indices": [
+      56232,
+      62480
+    ]
+  },
+  {
+    "class_index": 10,
+    "interval_start": 98.0,
+    "interval_end": 141.0,
+    "mean_val": 117.95613894669441,
+    "num_samples": 6247,
+    "sample_indices": [
+      62480,
+      68727
+    ]
+  },
+  {
+    "class_index": 11,
+    "interval_start": 141.0,
+    "interval_end": 219.0,
+    "mean_val": 176.45173683368017,
+    "num_samples": 6247,
+    "sample_indices": [
+      68727,
+      74974
+    ]
+  },
+  {
+    "class_index": 12,
+    "interval_start": 219.0,
+    "interval_end": 371.0,
+    "mean_val": 284.8527293100688,
+    "num_samples": 6247,
+    "sample_indices": [
+      74974,
+      81221
+    ]
+  },
+  {
+    "class_index": 13,
+    "interval_start": 371.0,
+    "interval_end": 725.0,
+    "mean_val": 520.5897230670722,
+    "num_samples": 6247,
+    "sample_indices": [
+      81221,
+      87468
+    ]
+  },
+  {
+    "class_index": 14,
+    "interval_start": 725.0,
+    "interval_end": 2092.0,
+    "mean_val": 1218.070433808228,
+    "num_samples": 6247,
+    "sample_indices": [
+      87468,
+      93715
+    ]
+  },
+  {
+    "class_index": 15,
+    "interval_start": 2092.0,
+    "interval_end": 942572.0,
+    "mean_val": 12927.011525532256,
+    "num_samples": 6247,
+    "sample_indices": [
+      93715,
+      99962
+    ]
+  }
+]
