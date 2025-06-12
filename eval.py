@@ -69,8 +69,8 @@ from transformers.utils.versions import require_version
 import torch.nn.functional as F
 from loguru import logger
 
-from legacy.RetweetModelLegacy import RetweetConfig, RetweetBaseModel, RetweetClassificationModel, RetweetRegressionModel
-from train_utils_legacy import feature_collator, evaluation_loop
+from model.RetweetModel import RetweetConfig, RetweetBaseModel, RetweetClassificationModel, RetweetRegressionModel
+from train_utils import feature_collator, evaluation_loop
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)

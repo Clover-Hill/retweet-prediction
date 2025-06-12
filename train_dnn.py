@@ -68,16 +68,30 @@ from transformers.utils.versions import require_version
 import torch.nn.functional as F
 from loguru import logger
 
-from legacy.RetweetModelLegacy import RetweetConfig, RetweetBaseModel, RetweetClassificationModel, RetweetRegressionModel, RetweetMultiRegressionModel
-from train_utils_legacy import feature_collator, evaluation_loop
+from model.RetweetDNNModel import (
+    RetweetFeatureConfig,
+    RetweetFeatureModel, 
+    RetweetFusionModel, 
+    RetweetFusionConfig
+)
+from train_utils_dnn import (
+    feature_collator, 
+    evaluation_loop, 
+    label_scaling, 
+    label_inverse_scaling,
+    create_vocabulary_mapping,
+    get_feature_dimensions,
+    DENSE_FEATURES,
+    SPARSE_FEATURES,
+    VARLEN_SPARSE_FEATURES
+)
 
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
-MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Finetune a transformers model on a causal language modeling task")
     parser.add_argument(
-        "--dataset_name",
+        "--dataset_path",
         type=str,
         default=None,
         help="The name of the dataset to use (via the datasets library).",
@@ -150,13 +164,6 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
-        "--model_type",
-        type=str,
-        default=None,
-        help="Model type to use if training from scratch.",
-        choices=MODEL_TYPES,
-    )
-    parser.add_argument(
         "--preprocessing_num_workers",
         type=int,
         default=None,
@@ -210,8 +217,6 @@ def parse_args():
         ),
     )
     
-    # Qwen3 Args
-    
     parser.add_argument(
         "--project_name",
         type=str,
@@ -223,12 +228,6 @@ def parse_args():
         type=str,
         default=None,
         help="The name of the run.",
-    )
-    parser.add_argument(
-        "--head_type",
-        type=str,
-        default=None,
-        help="type of language model head, regression or classification",
     )
     parser.add_argument(
         "--logging_steps",
@@ -244,40 +243,52 @@ def parse_args():
         "--do_eval",
         action="store_true",
     )
+    
+    # Model hyperparameters
     parser.add_argument(
-        "--use_rich_text",
+        "--model_type",
+        type=str,
+        choices=["feature_only", "fusion"],
+        required=True,
+        help="Type of model to train",
+    )
+
+    parser.add_argument(
+        "--embedding_dim",
+        type=int,
+        default=32,
+        help="Embedding dimension for sparse features"
+    )
+    parser.add_argument(
+        "--dnn_hidden_units",
+        type=str,
+        default="2048,512,128",
+        help="Hidden units for DNN layers (comma-separated)"
+    )
+    parser.add_argument(
+        "--dnn_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout rate for DNN"
+    )
+    parser.add_argument(
+        "--varlen_max_len",
+        type=int,
+        default=20,
+        help="Maximum length for variable-length features"
+    )
+    parser.add_argument(
+        "--label_log_scaling",
         action="store_true",
-    )
-    parser.add_argument(
-        "--mlp_num",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--scalar_features_dim",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--dropout_rate",
-        type=float,
-        default=None,
-    )
-    parser.add_argument(
-        "--num_class",
-        type=int,
-        default=None,
-    )
-    parser.add_argument(
-        "--neg_pos_ratio",
-        type=float,
-        default=None,
+        help="Whether to use log scaling for labels"
     )
     
     args = parser.parse_args()
 
-    return args
+    # Parse hidden units
+    args.dnn_hidden_units = [int(x) for x in args.dnn_hidden_units.split(',')]
 
+    return args
 
 def main():
     args = parse_args()
@@ -347,90 +358,133 @@ def main():
         set_seed(args.seed)
 
     # -------------------------------------------------Load Dataset and Model------------------------------------------------------------
-    # Load config and model
-    config = RetweetConfig.from_pretrained( args.model_name_or_path )
-    config.mlp_num = args.mlp_num if args.mlp_num is not None else config.mlp_num
-    config.scalar_features_dim = args.scalar_features_dim if args.scalar_features_dim is not None else config.scalar_features_dim
-    config.dropout_rate = args.dropout_rate if args.dropout_rate is not None else config.dropout_rate
-    # Classification Args
-    config.neg_pos_ratio = args.neg_pos_ratio if args.neg_pos_ratio is not None else config.neg_pos_ratio
-    # Multi Regression Args
-    config.num_class = args.num_class if args.num_class is not None else config.num_class
+    
+    # Load dataset
+    logger.info("Loading dataset...")
+    dataset = load_from_disk(args.dataset_path)
+    
+    # Split dataset if needed
+    train_dataset = dataset["train"]
+    eval_dataset = dataset.get("eval", dataset.get("test", None))
+    
+    # Initialize tokenizer (for fusion model)
+    tokenizer = None
+    if args.model_type == "fusion":
+        if not args.model_name_or_path:
+            raise ValueError("--model_name_or_path is required for fusion model")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    
+    # Calculate feature dimensions from the actual data
+    logger.info("Calculating feature dimensions...")
+    dense_features_dim, sparse_feature_dims, varlen_feature_dims = get_feature_dimensions(train_dataset)
 
-    if args.head_type == "regression":
-        model_class = RetweetRegressionModel
-    elif args.head_type == "classification":
-        model_class = RetweetClassificationModel
-    elif args.head_type == "multi_regression":
-        model_class = RetweetMultiRegressionModel
+    logger.info(f"Dense features dimension: {dense_features_dim}")
+    logger.info(f"Sparse features: {len(sparse_feature_dims)} features")
+    logger.info(f"Variable-length features: {len(varlen_feature_dims)} features")
+
+    # Get vocabulary mappings for variable-length features
+    logger.info("Creating vocabulary mappings...")
+    if not os.path.exists("./data/vocab_mappings.json"):
+        vocab_mappings = create_vocabulary_mapping(train_dataset, VARLEN_SPARSE_FEATURES)
+
+        # Save vocabulary mappings
+        if args.output_dir:
+            os.makedirs(args.output_dir, exist_ok=True)
+            with open("./data/vocab_mappings.json", "w") as f:
+                json.dump(vocab_mappings, f, indent=4, ensure_ascii=False)
     else:
-        raise ValueError(f"Invalid head type: {args.head_type}. Choose either 'regression' or 'classification'.")
+        with open("./data/vocab_mappings.json", "r") as f:
+            vocab_mappings = json.load(f)
+    
+    # Initialize model
+    logger.info(f"Initializing {args.model_type} model...")
+    
+    if args.model_type == "feature_only":
+        # Create configuration object
+        config = RetweetFeatureConfig(
+            dense_features_dim=len(DENSE_FEATURES),
+            sparse_feature_dims=sparse_feature_dims,
+            varlen_feature_dims=varlen_feature_dims,
+            sparse_feature_names=SPARSE_FEATURES,
+            varlen_feature_names=VARLEN_SPARSE_FEATURES,
+            embedding_dim=args.embedding_dim,
+            dnn_hidden_units=args.dnn_hidden_units,
+            dnn_dropout=args.dnn_dropout,
+            dnn_activation='relu',
+            use_bn=True,
+            l2_reg=1e-4,
+            init_std=1e-4,
+            varlen_pooling_modes=['mean']
+        )
+        
+        # Initialize model with config
+        model = RetweetFeatureModel(config)
+        
+        if accelerator.is_main_process:
+            logger.info(f"Model arch: {model}")
 
-    if args.model_name_or_path and not args.from_scratch:
-        model = model_class.from_pretrained(
+    else:  # fusion
+        config = RetweetFusionConfig.from_pretrained(
+            args.model_name_or_path,
+            dense_features_dim=dense_features_dim,
+            sparse_features_dim=len(sparse_feature_dims),
+            embedding_dim=args.embedding_dim,
+            mlp_num=4,
+            fusion_hidden_size=1024,
+            dropout_rate=0.1
+        )
+        
+        # Store the actual dimensions in the config for the model
+        config.sparse_feature_dims = sparse_feature_dims
+        config.varlen_feature_dims = varlen_feature_dims
+        
+        model = RetweetFusionModel.from_pretrained(
             args.model_name_or_path,
             config=config,
+            ignore_mismatched_sizes=True
         )
-    else:
-        logger.info("Training new model from scratch")
-        model = model_class.from_config(config)
     
     # -------------------------------------------------Preprocess Dataset------------------------------------------------------------
     # Default to use gpt tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    # Initialize tokenizer (for fusion model)
+    tokenizer = None
+    if args.model_type == "fusion":
+        if not args.model_name_or_path:
+            raise ValueError("--model_name_or_path is required for fusion model")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
         
-    retweet_datasets = load_from_disk(args.dataset_name)
-    
-    if args.head_type == "regression" or args.head_type == "multi_regression":
-        # Only use viral tweets
-        retweet_datasets["train"] = retweet_datasets["train"].filter(lambda x: x['if_viral'] == 1)
-        retweet_datasets["eval"] = retweet_datasets["eval"].filter(lambda x: x['if_viral'] == 1)
-    
-    intervals = None
-    if args.head_type == "multi_regression":
-        # Load intervals if path provided
-        with open("/fs-computility/plm/shared/jqcao/projects/retweet-prediction/feature_engineering/count_intervals.json", 'r') as f:
-            intervals = json.load(f)
-
-    if args.use_rich_text:
-        feature_collate_fn = partial(
-            feature_collator,
-            tokenizer=tokenizer,
-            intervals=intervals,
-            use_rich_text=True
-        )
-    else:
-        feature_collate_fn = partial(
-            feature_collator,
-            tokenizer=tokenizer,
-            intervals=intervals,
-            use_rich_text=False
-        )
-        
+    # Create data collator
+    collate_fn = partial(
+        feature_collator,
+        tokenizer=tokenizer,
+        use_text=(args.model_type == "fusion"),
+        max_length=512,
+        varlen_max_len=args.varlen_max_len,
+        vocab_mappings = vocab_mappings,
+    )
     # --------------------------------------------------Start Training-----------------------------------------------------------
-    train_dataset = retweet_datasets["train"]
-    eval_dataset = retweet_datasets["eval"]
-    
-    # DataLoaders creation:
+    # Create data loaders
     train_dataloader = DataLoader(
-        train_dataset, collate_fn=feature_collate_fn, batch_size=args.per_device_eval_batch_size, 
-        shuffle=False,
+        train_dataset,
+        batch_size=args.per_device_train_batch_size,
+        shuffle=True,
+        collate_fn=collate_fn,
         num_workers=4,
-        prefetch_factor=4,
         pin_memory=True
     )
+    
+    eval_dataloader = None
     if eval_dataset is not None:
         eval_dataloader = DataLoader(
-            eval_dataset, collate_fn=feature_collate_fn, batch_size=args.per_device_eval_batch_size, 
+            eval_dataset,
+            batch_size=args.per_device_eval_batch_size,
             shuffle=False,
+            collate_fn=collate_fn,
             num_workers=4,
-            prefetch_factor=4,
             pin_memory=True
         )
-    else:
-        eval_dataloader = None
 
-    len_train_dataset = len(retweet_datasets)
+    len_train_dataset = len(train_dataset)
     
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
@@ -551,25 +605,27 @@ def main():
 
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
-                # Forward pass based on head type
-                if args.head_type == "regression":
-                    labels = batch['retweet_count']
-                elif args.head_type == "classification":  # classification
-                    labels = batch['if_viral']
-                elif args.head_type == "multi_regression":  # multi_class
-                    labels = batch['viral_class']
+                # Forward pass
+                if args.model_type == "fusion":
+                    outputs = model(
+                        input_ids=batch.get('input_ids'),
+                        attention_mask=batch.get('attention_mask'),
+                        dense_features=batch['dense_features'],
+                        sparse_features=batch['sparse_features'],
+                        varlen_features=batch['varlen_features'],
+                        labels=batch['labels']
+                    )
+                else:
+                    outputs = model(
+                        dense_features=batch['dense_features'],
+                        sparse_features=batch['sparse_features'],
+                        varlen_features=batch['varlen_features'],
+                        labels=batch['labels']
+                    )
                 
-                outputs = model(
-                    input_ids=batch['input_ids'],
-                    attention_mask=batch['attention_mask'],
-                    scalar_features=batch['scalar_features'],
-                    labels=labels
-                )
-
-                # We keep track of the loss at each epoch
                 loss = outputs.loss
                 logging_interval_loss += loss.detach().float()
-                
+
                 accelerator.backward(loss)
 
             # Checks if the accelerator has performed an optimization step behind the scenes
@@ -605,66 +661,25 @@ def main():
 
                     logging_interval_loss = 0
 
-            if isinstance(checkpointing_steps, int):
-                if completed_steps % checkpointing_steps == 0 and accelerator.sync_gradients:
-                    output_dir = f"step_{completed_steps}"
-                    if args.output_dir is not None:
-                        output_dir = os.path.join(args.output_dir, output_dir)
-
-                    # Save state for continue training
-                    accelerator.save_state(output_dir)
-
-                    # Save unwrap model
-                    unwrapped_model = accelerator.unwrap_model(model)
-                    unwrapped_model.save_pretrained(
-                          output_dir,
-                          is_main_process=accelerator.is_main_process,
-                          save_function=accelerator.save,
-                          state_dict=accelerator.get_state_dict(model)
-                    )
-
-                    if accelerator.is_main_process:
-                        unwrapped_model.config.save_pretrained(output_dir)
-                        tokenizer.save_pretrained(output_dir)
-
             if completed_steps >= args.max_train_steps:
                 break
         
         if eval_dataloader is not None:
-            logger.info(f"Evaluation for epoch {epoch + 1}")
+            logger.info(f"Running evaluation for epoch {epoch}...")
+            metrics = evaluation_loop(
+                model, 
+                eval_dataloader, 
+                accelerator,
+                use_text=(args.model_type == "fusion")
+            )
             
-            if args.head_type == "classification":
-                evaluation_metric = evaluation_loop(model, eval_dataloader, args.head_type, accelerator)
-                to_be_logged = {
-                    "eval/eval_loss": evaluation_metric['eval_loss'],
-                    "eval/eval_accuracy": evaluation_metric['accuracy'],
-                    "eval/eval_precision": evaluation_metric['precision'],
-                    "eval/eval_f1": evaluation_metric['f1'],
-                    "eval/eval_recall": evaluation_metric['recall'],
-                }
-                accelerator.log(to_be_logged,step=completed_steps)
-            elif args.head_type == "regression":
-                evaluation_metric = evaluation_loop(model, eval_dataloader, args.head_type, accelerator)
-                to_be_logged = {
-                    "eval/eval_loss": evaluation_metric['eval_loss'],
-                    "eval/eval_mae": evaluation_metric['mae'],
-                    "eval/eval_mse": evaluation_metric['mse'],
-                }
-                accelerator.log(to_be_logged,step=completed_steps)
-            elif args.head_type == "multi_regression":
-                evaluation_metric = evaluation_loop(model, eval_dataloader, args.head_type, accelerator, intervals = intervals)
-                to_be_logged = {
-                    "eval/eval_loss": evaluation_metric['eval_loss'],
-                    "eval/eval_accuracy": evaluation_metric['accuracy'],
-                    "eval/eval_precision": evaluation_metric['precision_macro'],
-                    "eval/eval_f1": evaluation_metric['f1_macro'],
-                    "eval/eval_recall": evaluation_metric['recall_macro'],
-                    "eval/eval_mae": evaluation_metric['mae'],
-                    "eval/eval_mse": evaluation_metric['mse'],
-                }
-                accelerator.log(to_be_logged,step=completed_steps)
-
-            logger.info(f"Evaluation metrics: {to_be_logged}")
+            logger.info(f"Epoch {epoch} evaluation metrics: {metrics}")
+            
+            if args.with_tracking:
+                accelerator.log(
+                    {f"eval/{k}": v for k, v in metrics.items()},
+                    step=completed_steps,
+                )
             
         if args.checkpointing_steps == "epoch":
             output_dir = f"epoch_{epoch}"
@@ -673,19 +688,20 @@ def main():
 
             # Save state for continue training
             accelerator.save_state(output_dir)
+            # unwrapped_model = accelerator.unwrap_model(model)
+            # unwrapped_model.config.save_pretrained(output_dir)
 
             # Save unwrap model
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                  output_dir,
-                  is_main_process=accelerator.is_main_process,
-                  save_function=accelerator.save,
-                  state_dict=accelerator.get_state_dict(model)
-            )
+            # unwrapped_model.save_pretrained(
+            #       output_dir,
+            #       is_main_process=accelerator.is_main_process,
+            #       save_function=accelerator.save,
+            #       state_dict=accelerator.get_state_dict(model)
+            # )
 
-            if accelerator.is_main_process:
-                unwrapped_model.config.save_pretrained(output_dir)
-                tokenizer.save_pretrained(output_dir)
+            # if accelerator.is_main_process:
+            #     unwrapped_model.config.save_pretrained(output_dir)
+            #     tokenizer.save_pretrained(output_dir)
 
 if __name__ == "__main__":
     main()
