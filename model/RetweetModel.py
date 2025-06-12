@@ -60,7 +60,6 @@ class RetweetFeatureConfig(PretrainedConfig):
         self.init_std = init_std
         self.varlen_pooling_modes = varlen_pooling_modes
 
-
 class DNN(nn.Module):
     """Deep Neural Network module with batch normalization and dropout"""
     
@@ -165,8 +164,13 @@ class VarlenPooling(nn.Module):
         elif self.mode == 'max':
             # Replace padding with -inf for max pooling
             mask_expanded = mask.unsqueeze(-1)
-            embeddings_masked = embeddings.masked_fill(~mask_expanded.bool(), float('-inf'))
-            return embeddings_masked.max(dim=1)[0]
+            # Use a large negative value instead of -inf to prevent NaN
+            embeddings_masked = embeddings.masked_fill(~mask_expanded.bool(), -1e9)
+            pooled = embeddings_masked.max(dim=1)[0]
+            # Replace -1e9 with 0 for all-padding sequences
+            all_padding = (~mask.bool()).all(dim=1, keepdim=True)
+            pooled = pooled.masked_fill(all_padding, 0)
+            return pooled
         else:
             raise ValueError(f"Unsupported pooling mode: {self.mode}")
 
@@ -175,7 +179,17 @@ class RetweetFeatureModel(PreTrainedModel):
     """Feature-only model for retweet prediction with Transformers integration"""
     
     config_class = RetweetFeatureConfig
-    base_model_prefix = "retweet_feature"
+    
+    def _init_weights(self, module):
+        """Initialize the weights"""
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.config.init_std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.config.init_std)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
     
     def __init__(self, config: RetweetFeatureConfig):
         super().__init__(config)
@@ -203,8 +217,6 @@ class RetweetFeatureModel(PreTrainedModel):
             len(config.varlen_feature_names) * len(config.varlen_pooling_modes) * config.embedding_dim  # Varlen embeddings
         )
         
-        pdb.set_trace()
-
         # DNN layers
         self.dnn = DNN(
             inputs_dim=dnn_input_dim,
@@ -222,17 +234,6 @@ class RetweetFeatureModel(PreTrainedModel):
         
         # Initialize weights
         self.post_init()
-    
-    def _init_weights(self, module):
-        """Initialize the weights"""
-        if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=self.config.init_std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=self.config.init_std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
     
     def forward(
         self,
@@ -288,7 +289,7 @@ class RetweetFeatureModel(PreTrainedModel):
         loss = None
         if labels is not None:
             # MSE loss for regression
-            loss = F.mse_loss(logits, labels)
+            loss = F.l1_loss(logits, labels)
         
         if not return_dict:
             output = (logits,)

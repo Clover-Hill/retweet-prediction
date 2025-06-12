@@ -1,3 +1,4 @@
+from loguru import logger
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -119,7 +120,7 @@ def get_feature_dimensions(dataset):
     for feat in SPARSE_FEATURES:
         if feat in df.columns:
             # Count unique values + 1 for unknown/padding
-            n_unique = df[feat].nunique()
+            n_unique = df[feat].max()
             # Add extra space for unknown values
             sparse_feature_dims[feat] = n_unique + 2
         else:
@@ -189,6 +190,8 @@ def create_vocabulary_mapping(dataset, varlen_features=VARLEN_SPARSE_FEATURES):
                     idx += 1
             
             vocab_mappings[feat] = vocab
+        
+        logger.info(f"Created vocabulary for feature '{feat}' with {len(vocab)} tokens.")
     
     return vocab_mappings
 
