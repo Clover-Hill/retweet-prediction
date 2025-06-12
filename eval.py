@@ -23,6 +23,7 @@ https://huggingface.co/models?filter=text-generation
 # You can also adapt this script on your own causal language modeling task. Pointers for this are left as comments.
 
 import accelerate
+import csv
 import sys
 import inspect
 import pdb 
@@ -83,7 +84,7 @@ def parse_args():
         help="The name of the dataset to use (via the datasets library).",
     )
     parser.add_argument(
-        "--model_name_or_path",
+        "--classification_model_path",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=False,
@@ -264,6 +265,16 @@ def parse_args():
         default=None,
     )
     parser.add_argument(
+        "--viral_threshold",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--viral_mean_val",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
         "--neg_pos_ratio",
         type=float,
         default=None,
@@ -272,7 +283,6 @@ def parse_args():
     args = parser.parse_args()
 
     return args
-
 
 def main():
     args = parse_args()
@@ -289,18 +299,6 @@ def main():
         )
     ])
     
-    if args.report_to == "wandb":
-        accelerator.init_trackers(
-            project_name=args.project_name, 
-            config=args,
-            init_kwargs={
-                "wandb": {
-                    "name": args.run_name if args.run_name is not None else None,
-                    "save_code": True,
-                },
-            }
-        )
-
     # Make one log on every process with the configuration for debugging.
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
@@ -343,44 +341,20 @@ def main():
 
     # -------------------------------------------------Load Dataset and Model------------------------------------------------------------
     # Load config and model
-    config = RetweetConfig.from_pretrained( args.model_name_or_path )
-    config.mlp_num = args.mlp_num if args.mlp_num is not None else config.mlp_num
-    config.scalar_features_dim = args.scalar_features_dim if args.scalar_features_dim is not None else config.scalar_features_dim
-    config.dropout_rate = args.dropout_rate if args.dropout_rate is not None else config.dropout_rate
-    config.neg_pos_ratio = args.neg_pos_ratio if args.neg_pos_ratio is not None else config.neg_pos_ratio
+    config = RetweetConfig.from_pretrained( args.classification_model_path )
 
-    if args.head_type == "regression":
-        model_class = RetweetRegressionModel
-    elif args.head_type == "classification":
-        model_class = RetweetClassificationModel
-    else:
-        raise ValueError(f"Invalid head type: {args.head_type}. Choose either 'regression' or 'classification'.")
-
-    if args.model_name_or_path and not args.from_scratch:
-        model = model_class.from_pretrained(
-            args.model_name_or_path,
-            config=config,
-        )
-    else:
-        logger.info("Training new model from scratch")
-        model = model_class.from_config(config)
-    
+    classification_model = RetweetClassificationModel.from_pretrained( args.classification_model_path )
     
     # -------------------------------------------------Preprocess Dataset------------------------------------------------------------
     # Default to use gpt tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-        
+    tokenizer = AutoTokenizer.from_pretrained(args.classification_model_path)
     retweet_datasets = load_from_disk(args.dataset_name)
-    
-    if args.head_type == "regression":
-        # Only use viral tweets
-        retweet_datasets["train"] = retweet_datasets["train"].filter(lambda x: x['if_viral'] == 1)
-        retweet_datasets["eval"] = retweet_datasets["eval"].filter(lambda x: x['if_viral'] == 1)
     
     # --------------------------------------------------Evaluation-----------------------------------------------------------
     feature_collate_fn = partial(
         feature_collator,
         tokenizer=tokenizer,
+        use_rich_text=False
     )
     
     if args.do_eval:
@@ -392,29 +366,125 @@ def main():
             pin_memory=True
         )
         # Create a partial function with your specific parameters
-        model, eval_dataloader = accelerator.prepare( model, eval_dataloader )
+        classification_model, eval_dataloader = accelerator.prepare( classification_model, eval_dataloader )
 
-        model.eval()
-        total_loss = 0
-
-        for batch in tqdm(eval_dataloader, desc = "Evaluating Model"):
+        all_logits = []
+        all_retweet_counts = []
+        classification_model.eval()
+        
+        for batch in tqdm(eval_dataloader, desc = "Evaluating Model", disable=not accelerator.is_local_main_process):
             with torch.no_grad():
-                # Forward pass based on head type
-                if args.head_type == "regression":
-                    labels = batch['retweet_counts']
-                else:  # classification
-                    labels = batch['if_viral']
                 
-                outputs = model(
+                classification_outputs = classification_model(
                     input_ids=batch['input_ids'],
                     attention_mask=batch['attention_mask'],
                     scalar_features=batch['scalar_features'],
-                    labels=labels
                 )
+                classification_logits = classification_outputs.logits
+                classification_logits = torch.sigmoid(classification_logits)
                 
-                total_loss += outputs.loss.item()
+                # Gather predictions and labels from all processes
+                gathered_logits = accelerator.gather_for_metrics(classification_logits)
+                gathered_retweet_counts = accelerator.gather_for_metrics(batch['retweet_count'])
+                
+                all_logits.extend(gathered_logits.cpu().numpy().tolist())
+                all_retweet_counts.extend(gathered_retweet_counts.cpu().numpy().tolist())
 
-        logger.info(f"Evaluation Loss: {total_loss / len(eval_dataloader)}")
+        # Only compute metrics on main process
+        if accelerator.is_main_process:
+            all_logits = torch.tensor(all_logits)
+            all_retweet_counts = torch.tensor(all_retweet_counts)
+            
+            classification_predictions = (all_logits > args.viral_threshold).float()
+            mae_loss = 0
+            
+            for i in range(len(all_retweet_counts)):
+                if classification_predictions[i] == 1:
+                    mae_loss += abs(all_retweet_counts[i] - args.viral_mean_val)
+                else:
+                    mae_loss += abs(all_retweet_counts[i] - 0)
+            
+            logger.info(f"MAE Loss: {mae_loss / len(all_retweet_counts)}")
+            
+            # Optional: plot histogram of all_logits
+            # import matplotlib.pyplot as plt
+            # plt.hist(all_logits.numpy(), bins=100, range=(0, 1))
+            # plt.xlabel('Logits')
+            # plt.ylabel('Frequency')
+            # plt.title('Histogram of Classification Logits')
+            # plt.savefig('imgs/classification_logits_histogram.png')
+        
+        accelerator.wait_for_everyone()
+        return
+
+    if args.do_test:
+        test_dataloader = DataLoader(
+            retweet_datasets["test"], collate_fn=feature_collate_fn, batch_size=args.per_device_eval_batch_size, 
+            shuffle=False,
+            num_workers=4,
+            prefetch_factor=4,
+            pin_memory=True
+        )
+        
+        # Prepare model and dataloader for distributed evaluation
+        classification_model, test_dataloader = accelerator.prepare( classification_model, test_dataloader )
+        
+        all_logits = []
+        all_tweet_ids = []
+        classification_model.eval()
+        
+        for batch in tqdm(test_dataloader, desc = "Testing Model", disable=not accelerator.is_local_main_process):
+            with torch.no_grad():
+                classification_outputs = classification_model(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    scalar_features=batch['scalar_features'],
+                )
+                classification_logits = classification_outputs.logits
+                classification_logits = torch.sigmoid(classification_logits)
+                
+                # Gather predictions and IDs from all processes
+                gathered_logits = accelerator.gather_for_metrics(classification_logits)
+                gathered_ids = accelerator.gather_for_metrics(batch['id'])
+                
+                all_logits.extend(gathered_logits.cpu().numpy().tolist())
+                all_tweet_ids.extend(gathered_ids.cpu().numpy().tolist())
+        
+        # Only save results on main process
+        if accelerator.is_main_process:
+            all_logits = torch.tensor(all_logits)
+            
+            if not os.path.exists(args.output_dir):
+                os.makedirs(args.output_dir)
+                logger.info(f"Created output directory: {args.output_dir}")
+            
+            # Save sigmoided logits to pickle file
+            with open(os.path.join(args.output_dir, 'test_sigmoided_logits.pkl'), 'wb') as f:
+                pickle.dump(all_logits.numpy(), f)
+            logger.info(f"Saved sigmoided logits to {os.path.join(args.output_dir, 'test_sigmoided_logits.pkl')}")
+            
+            # Generate predictions based on threshold
+            classification_predictions = (all_logits > args.viral_threshold).float()
+            
+            # Convert predictions to retweet counts
+            predicted_retweet_counts = []
+            for pred in classification_predictions:
+                if pred == 1:
+                    predicted_retweet_counts.append(int(args.viral_mean_val))
+                else:
+                    predicted_retweet_counts.append(0)
+            
+            # Write results to txt file
+            output_file = os.path.join(args.output_dir, 'test_predictions.txt')
+            with open(output_file, 'w') as f:
+                writer = csv.writer(f)
+                writer.writerow(["TweetID", "NoRetweets"])
+                for tweet_id, prediction in zip(all_tweet_ids, predicted_retweet_counts):
+                    writer.writerow([str(int(tweet_id)), str(prediction)])
+            
+            logger.info(f"Saved test predictions to {output_file}")
+        
+        accelerator.wait_for_everyone()
         return
 
 if __name__ == "__main__":

@@ -3,6 +3,8 @@ knn/
 baseline/
 checkpoint/
 wandb/
+imgs/
+result/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

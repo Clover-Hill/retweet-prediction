@@ -245,6 +245,10 @@ def parse_args():
         action="store_true",
     )
     parser.add_argument(
+        "--use_rich_text",
+        action="store_true",
+    )
+    parser.add_argument(
         "--mlp_num",
         type=int,
         default=None,
@@ -388,11 +392,20 @@ def main():
         with open("/fs-computility/plm/shared/jqcao/projects/retweet-prediction/feature_engineering/count_intervals.json", 'r') as f:
             intervals = json.load(f)
 
-    feature_collate_fn = partial(
-        feature_collator,
-        tokenizer=tokenizer,
-        intervals=intervals
-    )
+    if args.use_rich_text:
+        feature_collate_fn = partial(
+            feature_collator,
+            tokenizer=tokenizer,
+            intervals=intervals,
+            use_rich_text=True
+        )
+    else:
+        feature_collate_fn = partial(
+            feature_collator,
+            tokenizer=tokenizer,
+            intervals=intervals,
+            use_rich_text=False
+        )
         
     # --------------------------------------------------Start Training-----------------------------------------------------------
     train_dataset = retweet_datasets["train"]
@@ -540,7 +553,7 @@ def main():
             with accelerator.accumulate(model):
                 # Forward pass based on head type
                 if args.head_type == "regression":
-                    labels = batch['retweet_counts']
+                    labels = batch['retweet_count']
                 elif args.head_type == "classification":  # classification
                     labels = batch['if_viral']
                 elif args.head_type == "multi_regression":  # multi_class

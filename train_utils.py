@@ -24,7 +24,7 @@ def text_enrich(sample):
     return ret
 
 # 1. Modified Feature Collator with Viral Class Support
-def feature_collator(batch, tokenizer, intervals=None, max_length=512):
+def feature_collator(batch, tokenizer, intervals=None, max_length=512, use_rich_text=False):
     """
     Collate function to process batch data with log1p for heavy-tailed features
     and L2 normalization. Now supports viral_class labels.
@@ -40,7 +40,10 @@ def feature_collator(batch, tokenizer, intervals=None, max_length=512):
     """
     
     # Extract texts and tokenize
-    texts = [text_enrich(item) for item in batch]
+    if use_rich_text:
+        texts = [text_enrich(item) for item in batch]
+    else:
+        texts = [item['text'] for item in batch]
     
     # Tokenize texts
     encoded = tokenizer(
@@ -83,8 +86,14 @@ def feature_collator(batch, tokenizer, intervals=None, max_length=512):
     scalar_features = F.normalize(scalar_features, p=2, dim=-1)
     
     # Process labels
-    retweet_counts = torch.tensor([item['retweet_count'] for item in batch], dtype=torch.float32)
-    if_viral = torch.tensor([item['if_viral'] for item in batch], dtype=torch.float32)
+    if batch[0]['retweet_count'] is None:
+        retweet_count = torch.tensor([-1] * batch_size, dtype=torch.float32)
+        if_viral = torch.tensor([-1] * batch_size, dtype=torch.float32)
+    else:
+        retweet_count = torch.tensor([item['retweet_count'] for item in batch], dtype=torch.float32)
+        if_viral = torch.tensor([item['if_viral'] for item in batch], dtype=torch.float32)
+    
+    id = torch.tensor([item['id'] for item in batch], dtype=torch.long)
     
     # Calculate viral_class if intervals provided
     if intervals is not None:
@@ -97,10 +106,11 @@ def feature_collator(batch, tokenizer, intervals=None, max_length=512):
         viral_class = torch.tensor(viral_class, dtype=torch.long)
     
     result = {
+        'id': id,
         'input_ids': encoded['input_ids'],
         'attention_mask': encoded['attention_mask'],
         'scalar_features': scalar_features,
-        'retweet_counts': retweet_counts,
+        'retweet_count': retweet_count,
         'if_viral': if_viral
     }
     
@@ -154,7 +164,7 @@ def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=
         for batch in tqdm(eval_dataloader, desc="Evaluating", disable=not accelerator.is_local_main_process):
             # Get appropriate labels based on head type
             if head_type == "regression":
-                labels = batch['retweet_counts']
+                labels = batch['retweet_count']
             elif head_type == "classification":
                 labels = batch['if_viral']
             elif head_type == "multi_regression":  # multi_class
@@ -175,7 +185,7 @@ def evaluation_loop(model, eval_dataloader, head_type, accelerator, num_classes=
             gathered_loss = accelerator.gather(loss)
             gathered_logits = accelerator.gather(logits)
             gathered_labels = accelerator.gather(labels)
-            gathered_retweet_count = accelerator.gather(batch['retweet_counts'])
+            gathered_retweet_count = accelerator.gather(batch['retweet_count'])
             
             total_loss += gathered_loss.mean().item()
             num_batches += 1
